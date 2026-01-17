@@ -12,10 +12,10 @@ import os
 # --- SIVUN ASETUKSET ---
 st.set_page_config(page_title="Suku Kartalla", layout="wide")
 
-st.title("📍 Sukututkimusdata Kartalla")
+st.title("📍 Sukututkimusdata Kartalla (Kertyvä)")
 st.markdown("""
 Tämä sovellus lukee **GEDCOM-tiedoston**, poimii henkilöiden syntymäpaikat ja
-visualisoi ne aikajanalla Suomen kartalle.
+visualisoi ne kartalle siten, että **pisteet jäävät näkyviin**.
 """)
 
 # --- APUFUNKTIOT ---
@@ -29,32 +29,26 @@ def get_year_from_date(date_str):
 
 @st.cache_data
 def parse_gedcom(file_content):
-    """
-    Lukee GEDCOM-datan ja palauttaa Pandasin DataFramen.
-    Sisältää nyt automaattisen koodauksen korjauksen (UTF-8 / Latin-1).
-    """
+    """Lukee GEDCOM-datan ja palauttaa Pandasin DataFramen."""
     
-    # --- 1. Koodauksen korjaus ---
+    # 1. Koodauksen korjaus
     decoded_text = ""
     try:
-        # Yritetään ensin UTF-8 (standardi)
         decoded_text = file_content.decode('utf-8-sig')
     except UnicodeDecodeError:
         try:
-            # Jos ei onnistu, yritetään Latin-1 (yleinen Windows/Suomi vanhoissa tiedostoissa)
             decoded_text = file_content.decode('latin-1')
         except Exception:
-            # Jos mikään ei toimi, pakotetaan luku jättämällä virheet huomiotta
             decoded_text = file_content.decode('utf-8', errors='ignore')
 
-    # --- 2. Kirjoitetaan puhdas UTF-8 väliaikaiseen tiedostoon ---
-    # Avataan tiedosto tekstitilassa ('w') ja pakotetaan encoding='utf-8'
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".ged", mode='w', encoding='utf-8') as tmp_file:
-        tmp_file.write(decoded_text)
-        tmp_path = tmp_file.name
-
-    # --- 3. Jäsennys ---
+    # 2. Väliaikainen tiedosto
+    tmp_path = ""
     try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ged", mode='w', encoding='utf-8') as tmp_file:
+            tmp_file.write(decoded_text)
+            tmp_path = tmp_file.name
+
+        # 3. Jäsennys
         gedcom_parser = Parser()
         gedcom_parser.parse_file(tmp_path)
         
@@ -71,7 +65,7 @@ def parse_gedcom(file_content):
 
                     birth_data = element.get_birth_data()
                     
-                    if birth_data and birth_data[1]: # Jos paikka löytyy
+                    if birth_data and birth_data[1]: 
                         birth_date = birth_data[0]
                         birth_place = birth_data[1]
                         birth_year = get_year_from_date(birth_date)
@@ -84,39 +78,35 @@ def parse_gedcom(file_content):
                                 "Paikka": birth_place
                             })
                 except Exception:
-                    continue 
+                    continue
                     
     finally:
-        # Siivotaan väliaikainen tiedosto
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
     
     return pd.DataFrame(data)
 
 @st.cache_data
 def geocode_dataframe(df):
-    """
-    Hakee koordinaatit paikoille. 
-    Tämä on välimuistissa, jotta hidasta hakua ei tehdä turhaan uudestaan.
-    """
-    geolocator = Nominatim(user_agent="streamlit_family_map_v1")
+    """Hakee koordinaatit paikoille."""
+    geolocator = Nominatim(user_agent="streamlit_family_map_cumulative_v1")
     geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.1) 
     
     unique_places = df['Paikka'].unique()
     place_coords = {}
     
-    # Luodaan edistymispalkki
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(unique_places)
     
     for i, place in enumerate(unique_places):
-        # Päivitetään palkkia
         progress = (i + 1) / total
         progress_bar.progress(progress)
         status_text.text(f"Haetaan koordinaatteja: {place} ({i+1}/{total})")
         
-        # Lisätään hakuun maa, jos se puuttuu
         query = place
         if "finland" not in place.lower() and "suomi" not in place.lower():
             query = f"{place}, Finland"
@@ -133,11 +123,36 @@ def geocode_dataframe(df):
     status_text.empty()
     progress_bar.empty()
     
-    # Mapataan koordinaatit DataFrameen
     df['lat'] = df['Paikka'].map(lambda x: place_coords.get(x, (None, None))[0])
     df['lon'] = df['Paikka'].map(lambda x: place_coords.get(x, (None, None))[1])
     
     return df.dropna(subset=['lat', 'lon'])
+
+@st.cache_data
+def create_cumulative_data(df):
+    """
+    Monistaa datan siten, että vanhat tapahtumat pysyvät mukana uusina vuosina.
+    Tämä mahdollistaa "jäljen" jättämisen kartalle.
+    """
+    years = sorted(df['Vuosi'].unique())
+    cumulative_list = []
+    
+    # Käydään läpi jokainen vuosi, joka datassa esiintyy
+    for year in years:
+        # Otetaan kaikki rivit, jotka ovat tapahtuneet TÄNÄ vuonna tai AIEMMIN
+        mask = df['Vuosi'] <= year
+        step_data = df[mask].copy()
+        
+        # Asetetaan 'Animaatiovuosi'-sarake nykyiseksi silmukan vuodeksi.
+        # Näin Plotly luulee, että nämä kaikki tapahtuvat tässä "framessa".
+        step_data['Animaatiovuosi'] = year
+        cumulative_list.append(step_data)
+    
+    # Yhdistetään kaikki "framet" yhdeksi isoksi taulukoksi
+    if not cumulative_list:
+        return df
+    
+    return pd.concat(cumulative_list, ignore_index=True)
 
 # --- KÄYTTÖLIITTYMÄ JA LOGIIKKA ---
 
@@ -146,41 +161,42 @@ uploaded_file = st.file_uploader("Lataa GEDCOM-tiedosto (.ged)", type=['ged'])
 if uploaded_file is not None:
     st.info("Tiedosto ladattu. Käsitellään dataa...")
     
-    # 1. Jäsennä tiedosto
     bytes_data = uploaded_file.getvalue()
     df = parse_gedcom(bytes_data)
     
     if df.empty:
-        st.error("Tiedostosta ei löytynyt sopivia syntymätietoja. Tarkista tiedosto.")
+        st.error("Tiedostosta ei löytynyt sopivia syntymätietoja.")
     else:
-        st.success(f"Löydettiin {len(df)} henkilöä, joilla on syntymäaika ja -paikka.")
+        st.success(f"Löydettiin {len(df)} henkilöä.")
         
-        # 2. Geokoodaus (vain jos käyttäjä painaa nappia)
-        if st.button("Hae koordinaatit ja piirrä kartta"):
-            with st.spinner('Haetaan sijaintitietoja... Tämä voi kestää hetken.'):
+        if st.button("Hae koordinaatit ja piirrä kertyvä kartta"):
+            with st.spinner('Haetaan sijaintitietoja...'):
                 df_geo = geocode_dataframe(df)
             
             if df_geo.empty:
                 st.warning("Koordinaatteja ei löytynyt.")
             else:
-                st.success(f"Koordinaatit löytyi {len(df_geo)} tapahtumalle!")
+                st.info("Luodaan animaatiokehyksiä (tämä voi kestää hetken)...")
                 
-                # Järjestys animaatiota varten
+                # Järjestetään data ja luodaan kertyvä versio
                 df_geo = df_geo.sort_values("Vuosi")
+                df_cumulative = create_cumulative_data(df_geo)
                 
-                # 3. Piirrä kartta
+                st.success("Valmis! Piirretään karttaa.")
+                
+                # Piirrä kartta
                 fig = px.scatter_mapbox(
-                    df_geo,
+                    df_cumulative,
                     lat="lat",
                     lon="lon",
                     hover_name="Nimi",
-                    hover_data={"Syntymäaika": True, "Paikka": True, "lat": False, "lon": False, "Vuosi": False},
-                    color_discrete_sequence=['blue'], 
+                    hover_data={"Syntymäaika": True, "Paikka": True, "lat": False, "lon": False, "Vuosi": True, "Animaatiovuosi": False},
+                    color_discrete_sequence=['blue'],
                     zoom=4.5,
                     center={"lat": 64.5, "lon": 26.0},
-                    animation_frame="Vuosi",
-                    title=f"Syntymät aikajanalla ({df_geo['Vuosi'].min()} - {df_geo['Vuosi'].max()})",
-                    size_max=15
+                    animation_frame="Animaatiovuosi", # Käytetään uutta saraketta
+                    title=f"Suvun leviäminen ({df_geo['Vuosi'].min()} - {df_geo['Vuosi'].max()})",
+                    size_max=10
                 )
 
                 fig.update_layout(mapbox_style="open-street-map")
@@ -188,5 +204,5 @@ if uploaded_file is not None:
                 
                 st.plotly_chart(fig, use_container_width=True)
                 
-                with st.expander("Katso raakadata"):
+                with st.expander("Katso data"):
                     st.dataframe(df_geo)
