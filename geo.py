@@ -9,27 +9,21 @@ import re
 import tempfile
 import os
 
-# --- SIVUN ASETUKSET ---
+# --- 1. ASETUKSET (Tämän pitää olla AINA ensimmäinen komento) ---
 st.set_page_config(page_title="Suku Kartalla", layout="wide")
 
-st.title("📍 Sukututkimusdata Kartalla (Debug-tila)")
-
-# --- APUFUNKTIOT ---
+# --- 2. APUFUNKTIOT ---
 
 def get_year_from_date(date_str):
     if not date_str:
         return None
-    # Etsitään 4 numeroa (esim. 1850)
     match = re.search(r'\d{4}', str(date_str))
     return int(match.group(0)) if match else None
 
 @st.cache_data
 def parse_gedcom(file_content):
-    """
-    Kestävä jäsennys, joka etsii BIRT/PLAC tageja manuaalisesti.
-    """
-    
-    # 1. Koodauksen korjaus (UTF-8 / Latin-1 / ANSI)
+    """Lukee GEDCOM-tiedoston ja etsii syntymätiedot."""
+    # Koodauksen korjaus
     decoded_text = ""
     try:
         decoded_text = file_content.decode('utf-8-sig')
@@ -39,26 +33,27 @@ def parse_gedcom(file_content):
         except Exception:
             decoded_text = file_content.decode('utf-8', errors='ignore')
 
-    # 2. Tyhjien rivien siivous
+    # Siivotaan tyhjät rivit
     lines = decoded_text.splitlines()
     clean_lines = [line for line in lines if line.strip()]
     cleaned_text = "\n".join(clean_lines)
 
-    # 3. Väliaikainen tiedosto
+    # Väliaikainen tiedosto
     tmp_path = ""
+    data = []
+    
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ged", mode='w', encoding='utf-8') as tmp_file:
             tmp_file.write(cleaned_text)
             tmp_path = tmp_file.name
 
-        # 4. Jäsennys strict=False
+        # Parsitaan (strict=False)
         gedcom_parser = Parser()
         gedcom_parser.parse_file(tmp_path, strict=False)
         
         root_child_elements = gedcom_parser.get_root_child_elements()
-        data = []
 
-        # --- MANUAALINEN JÄSENNYS ---
+        # Käydään läpi henkilöt
         for element in root_child_elements:
             if isinstance(element, IndividualElement):
                 try:
@@ -71,27 +66,18 @@ def parse_gedcom(file_content):
                     birth_date = ""
                     birth_place = ""
 
-                    # Käydään läpi henkilön kaikki alitagit (lapset) manuaalisesti
-                    # Etsitään BIRT (syntymä) tai CHR (kaste)
+                    # Manuaalinen tagien etsintä (BIRT/CHR -> DATE/PLAC)
                     for child in element.get_child_elements():
                         tag = child.get_tag()
-                        
-                        if tag == "BIRT" or tag == "CHR":
-                            # Jos löytyi syntymä- tai kastetapahtuma, katsotaan sen sisälle
+                        if tag in ["BIRT", "CHR"]:
                             for sub_child in child.get_child_elements():
-                                sub_tag = sub_child.get_tag()
-                                sub_val = sub_child.get_value()
-                                
-                                if sub_tag == "DATE" and not birth_date:
-                                    birth_date = sub_val
-                                if sub_tag == "PLAC" and not birth_place:
-                                    birth_place = sub_val
-                            
-                            # Jos molemmat löytyi, lopetetaan etsintä tämän hlön osalta
+                                if sub_child.get_tag() == "DATE" and not birth_date:
+                                    birth_date = sub_child.get_value()
+                                if sub_child.get_tag() == "PLAC" and not birth_place:
+                                    birth_place = sub_child.get_value()
                             if birth_date and birth_place:
                                 break
 
-                    # Tallennetaan jos tiedot löytyi
                     if birth_place and birth_date:
                         birth_year = get_year_from_date(birth_date)
                         if birth_year:
@@ -101,26 +87,94 @@ def parse_gedcom(file_content):
                                 "Vuosi": birth_year,
                                 "Paikka": birth_place
                             })
-                            
                 except Exception:
                     continue
-                    
+    except Exception as e:
+        st.error(f"Virhe tiedoston luvussa: {e}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
-            except Exception:
+            except:
                 pass
     
     return pd.DataFrame(data)
 
 @st.cache_data
 def geocode_dataframe(df):
-    geolocator = Nominatim(user_agent="streamlit_family_map_final_fix")
+    """Hakee koordinaatit."""
+    geolocator = Nominatim(user_agent="family_map_app_v3")
     geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.1) 
     
     unique_places = df['Paikka'].unique()
     place_coords = {}
     
-    progress_bar = st.progress(0)
-    status_text
+    # Progress bar
+    my_bar = st.progress(0)
+    
+    for i, place in enumerate(unique_places):
+        my_bar.progress((i + 1) / len(unique_places))
+        
+        if place not in place_coords:
+            query = place
+            if "finland" not in place.lower() and "suomi" not in place.lower():
+                query = f"{place}, Finland"
+            try:
+                loc = geocode(query)
+                place_coords[place] = (loc.latitude, loc.longitude) if loc else (None, None)
+            except:
+                place_coords[place] = (None, None)
+            
+    my_bar.empty()
+    
+    df['lat'] = df['Paikka'].map(lambda x: place_coords.get(x, (None, None))[0])
+    df['lon'] = df['Paikka'].map(lambda x: place_coords.get(x, (None, None))[1])
+    
+    return df.dropna(subset=['lat', 'lon'])
+
+@st.cache_data
+def create_cumulative_data(df, step=5):
+    """Luo kertyvän datan animaatiota varten."""
+    min_y = int(df['Vuosi'].min())
+    max_y = int(df['Vuosi'].max())
+    years = range(min_y, max_y + step, step)
+    
+    cumulative = []
+    for y in years:
+        mask = df['Vuosi'] <= y
+        part = df.loc[mask].copy()
+        if not part.empty:
+            part['Animaatiovuosi'] = y
+            cumulative.append(part)
+            
+    return pd.concat(cumulative, ignore_index=True) if cumulative else df
+
+# --- 3. PÄÄOHJELMA (MAIN) ---
+def main():
+    st.title("📍 Sukututkimusdata Kartalla")
+    
+    st.write("Lataa GEDCOM-tiedosto alla olevasta painikkeesta:")
+    
+    # TÄMÄ ON SE LATAUSPAINIKE. Se on nyt varmasti näkyvissä.
+    uploaded_file = st.file_uploader("Valitse .ged tiedosto", type=['ged'])
+
+    if uploaded_file is not None:
+        st.write("---")
+        st.info("Tiedosto vastaanotettu. Luetaan dataa...")
+        
+        bytes_data = uploaded_file.getvalue()
+        df = parse_gedcom(bytes_data)
+        
+        if df.empty:
+            st.warning("Tiedostosta ei löytynyt henkilöitä, joilla on sekä syntymäaika että -paikka.")
+            st.write("Tarkista, että GEDCOM-tiedostossa on BIRT ja PLAC tagit.")
+        else:
+            st.success(f"Löydettiin {len(df)} henkilöä!")
+            st.dataframe(df.head())
+
+            # Painike koordinaattien hakuun
+            if st.button("Hae koordinaatit ja piirrä kartta"):
+                with st.spinner("Haetaan sijainteja (tämä vie hetken)..."):
+                    df_geo = geocode_dataframe(df)
+                
+                if df_geo.empty
