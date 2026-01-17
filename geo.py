@@ -1,3 +1,32 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
+from gedcom.element.individual import IndividualElement
+from gedcom.parser import Parser
+import re
+import tempfile
+import os
+
+# --- SIVUN ASETUKSET ---
+st.set_page_config(page_title="Suku Kartalla", layout="wide")
+
+st.title("📍 Sukututkimusdata Kartalla")
+st.markdown("""
+Tämä sovellus lukee **GEDCOM-tiedoston**, poimii henkilöiden syntymäpaikat ja
+visualisoi ne aikajanalla Suomen kartalle.
+""")
+
+# --- APUFUNKTIOT ---
+
+def get_year_from_date(date_str):
+    """Etsii ensimmäisen 4-numeroisen luvun merkkijonosta."""
+    if not date_str:
+        return None
+    match = re.search(r'\d{4}', date_str)
+    return int(match.group(0)) if match else None
+
 @st.cache_data
 def parse_gedcom(file_content):
     """
@@ -6,7 +35,6 @@ def parse_gedcom(file_content):
     """
     
     # --- 1. Koodauksen korjaus ---
-    # Yritetään purkaa tavut tekstiksi eri koodauksilla
     decoded_text = ""
     try:
         # Yritetään ensin UTF-8 (standardi)
@@ -64,3 +92,6 @@ def parse_gedcom(file_content):
             os.remove(tmp_path)
     
     return pd.DataFrame(data)
+
+@st.cache_data
+def
