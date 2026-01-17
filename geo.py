@@ -25,6 +25,11 @@ def get_year_from_date(date_str):
 
 @st.cache_data
 def parse_gedcom(file_content):
+    """
+    Lukee GEDCOM-datan.
+    KORJAUS: strict=False ja tyhjien rivien siivous.
+    """
+    
     # 1. Koodauksen korjaus
     decoded_text = ""
     try:
@@ -35,16 +40,23 @@ def parse_gedcom(file_content):
         except Exception:
             decoded_text = file_content.decode('utf-8', errors='ignore')
 
-    # 2. Väliaikainen tiedosto
+    # 2. SIIVOUS: Poistetaan tyhjät rivit, jotka usein aiheuttavat "FormatViolation" virheen
+    lines = decoded_text.splitlines()
+    # Otetaan vain rivit, joissa on tekstiä (ei pelkkiä välilyöntejä)
+    clean_lines = [line for line in lines if line.strip()]
+    cleaned_text = "\n".join(clean_lines)
+
+    # 3. Kirjoitetaan siivottu teksti väliaikaiseen tiedostoon
     tmp_path = ""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ged", mode='w', encoding='utf-8') as tmp_file:
-            tmp_file.write(decoded_text)
+            tmp_file.write(cleaned_text)
             tmp_path = tmp_file.name
 
-        # 3. Jäsennys
+        # 4. Jäsennys: HUOM! strict=False on lisätty tähän
         gedcom_parser = Parser()
-        gedcom_parser.parse_file(tmp_path)
+        # strict=False sallii pienet virheet tiedostossa kaatumatta
+        gedcom_parser.parse_file(tmp_path, strict=False) 
         
         root_child_elements = gedcom_parser.get_root_child_elements()
         data = []
