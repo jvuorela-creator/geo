@@ -94,4 +94,99 @@ def parse_gedcom(file_content):
     return pd.DataFrame(data)
 
 @st.cache_data
-def
+def geocode_dataframe(df):
+    """
+    Hakee koordinaatit paikoille. 
+    Tämä on välimuistissa, jotta hidasta hakua ei tehdä turhaan uudestaan.
+    """
+    geolocator = Nominatim(user_agent="streamlit_family_map_v1")
+    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.1) 
+    
+    unique_places = df['Paikka'].unique()
+    place_coords = {}
+    
+    # Luodaan edistymispalkki
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(unique_places)
+    
+    for i, place in enumerate(unique_places):
+        # Päivitetään palkkia
+        progress = (i + 1) / total
+        progress_bar.progress(progress)
+        status_text.text(f"Haetaan koordinaatteja: {place} ({i+1}/{total})")
+        
+        # Lisätään hakuun maa, jos se puuttuu
+        query = place
+        if "finland" not in place.lower() and "suomi" not in place.lower():
+            query = f"{place}, Finland"
+            
+        try:
+            location = geocode(query)
+            if location:
+                place_coords[place] = (location.latitude, location.longitude)
+            else:
+                place_coords[place] = (None, None)
+        except Exception:
+            place_coords[place] = (None, None)
+            
+    status_text.empty()
+    progress_bar.empty()
+    
+    # Mapataan koordinaatit DataFrameen
+    df['lat'] = df['Paikka'].map(lambda x: place_coords.get(x, (None, None))[0])
+    df['lon'] = df['Paikka'].map(lambda x: place_coords.get(x, (None, None))[1])
+    
+    return df.dropna(subset=['lat', 'lon'])
+
+# --- KÄYTTÖLIITTYMÄ JA LOGIIKKA ---
+
+uploaded_file = st.file_uploader("Lataa GEDCOM-tiedosto (.ged)", type=['ged'])
+
+if uploaded_file is not None:
+    st.info("Tiedosto ladattu. Käsitellään dataa...")
+    
+    # 1. Jäsennä tiedosto
+    bytes_data = uploaded_file.getvalue()
+    df = parse_gedcom(bytes_data)
+    
+    if df.empty:
+        st.error("Tiedostosta ei löytynyt sopivia syntymätietoja. Tarkista tiedosto.")
+    else:
+        st.success(f"Löydettiin {len(df)} henkilöä, joilla on syntymäaika ja -paikka.")
+        
+        # 2. Geokoodaus (vain jos käyttäjä painaa nappia)
+        if st.button("Hae koordinaatit ja piirrä kartta"):
+            with st.spinner('Haetaan sijaintitietoja... Tämä voi kestää hetken.'):
+                df_geo = geocode_dataframe(df)
+            
+            if df_geo.empty:
+                st.warning("Koordinaatteja ei löytynyt.")
+            else:
+                st.success(f"Koordinaatit löytyi {len(df_geo)} tapahtumalle!")
+                
+                # Järjestys animaatiota varten
+                df_geo = df_geo.sort_values("Vuosi")
+                
+                # 3. Piirrä kartta
+                fig = px.scatter_mapbox(
+                    df_geo,
+                    lat="lat",
+                    lon="lon",
+                    hover_name="Nimi",
+                    hover_data={"Syntymäaika": True, "Paikka": True, "lat": False, "lon": False, "Vuosi": False},
+                    color_discrete_sequence=['blue'], 
+                    zoom=4.5,
+                    center={"lat": 64.5, "lon": 26.0},
+                    animation_frame="Vuosi",
+                    title=f"Syntymät aikajanalla ({df_geo['Vuosi'].min()} - {df_geo['Vuosi'].max()})",
+                    size_max=15
+                )
+
+                fig.update_layout(mapbox_style="open-street-map")
+                fig.update_layout(margin={"r":0,"t":40,"l":0,"b":0})
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+                with st.expander("Katso raakadata"):
+                    st.dataframe(df_geo)
