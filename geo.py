@@ -8,20 +8,16 @@ from gedcom.parser import Parser
 import re
 import tempfile
 import os
+import numpy as np
 
 # --- SIVUN ASETUKSET ---
 st.set_page_config(page_title="Suku Kartalla", layout="wide")
 
 st.title("📍 Sukututkimusdata Kartalla (Kertyvä)")
-st.markdown("""
-Tämä sovellus lukee **GEDCOM-tiedoston**, poimii henkilöiden syntymäpaikat ja
-visualisoi ne kartalle siten, että **pisteet jäävät näkyviin**.
-""")
 
 # --- APUFUNKTIOT ---
 
 def get_year_from_date(date_str):
-    """Etsii ensimmäisen 4-numeroisen luvun merkkijonosta."""
     if not date_str:
         return None
     match = re.search(r'\d{4}', date_str)
@@ -29,8 +25,6 @@ def get_year_from_date(date_str):
 
 @st.cache_data
 def parse_gedcom(file_content):
-    """Lukee GEDCOM-datan ja palauttaa Pandasin DataFramen."""
-    
     # 1. Koodauksen korjaus
     decoded_text = ""
     try:
@@ -91,8 +85,7 @@ def parse_gedcom(file_content):
 
 @st.cache_data
 def geocode_dataframe(df):
-    """Hakee koordinaatit paikoille."""
-    geolocator = Nominatim(user_agent="streamlit_family_map_cumulative_v1")
+    geolocator = Nominatim(user_agent="streamlit_family_map_optimized_v2")
     geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.1) 
     
     unique_places = df['Paikka'].unique()
@@ -107,18 +100,19 @@ def geocode_dataframe(df):
         progress_bar.progress(progress)
         status_text.text(f"Haetaan koordinaatteja: {place} ({i+1}/{total})")
         
-        query = place
-        if "finland" not in place.lower() and "suomi" not in place.lower():
-            query = f"{place}, Finland"
-            
-        try:
-            location = geocode(query)
-            if location:
-                place_coords[place] = (location.latitude, location.longitude)
-            else:
+        if place not in place_coords:
+            query = place
+            if "finland" not in place.lower() and "suomi" not in place.lower():
+                query = f"{place}, Finland"
+                
+            try:
+                location = geocode(query)
+                if location:
+                    place_coords[place] = (location.latitude, location.longitude)
+                else:
+                    place_coords[place] = (None, None)
+            except Exception:
                 place_coords[place] = (None, None)
-        except Exception:
-            place_coords[place] = (None, None)
             
     status_text.empty()
     progress_bar.empty()
@@ -129,80 +123,90 @@ def geocode_dataframe(df):
     return df.dropna(subset=['lat', 'lon'])
 
 @st.cache_data
-def create_cumulative_data(df):
+def create_cumulative_data(df, step=5):
     """
-    Monistaa datan siten, että vanhat tapahtumat pysyvät mukana uusina vuosina.
-    Tämä mahdollistaa "jäljen" jättämisen kartalle.
+    OPTIMOITU VERSIO:
+    Luo animaatiokehykset vain 'step' (oletus 5) vuoden välein.
+    Tämä estää muistin loppumisen (AxiosError 404).
     """
-    years = sorted(df['Vuosi'].unique())
+    min_year = int(df['Vuosi'].min())
+    max_year = int(df['Vuosi'].max())
+    
+    # Luodaan aikasarja 5 vuoden välein (esim. 1700, 1705, 1710...)
+    years = range(min_year, max_year + step, step)
+    
     cumulative_list = []
     
-    # Käydään läpi jokainen vuosi, joka datassa esiintyy
     for year in years:
-        # Otetaan kaikki rivit, jotka ovat tapahtuneet TÄNÄ vuonna tai AIEMMIN
+        # Otetaan mukaan kaikki, jotka ovat syntyneet ennen tätä vuotta
         mask = df['Vuosi'] <= year
-        step_data = df[mask].copy()
+        # Otetaan vain tarvittavat sarakkeet kopioon muistin säästämiseksi
+        step_data = df.loc[mask, ['Nimi', 'lat', 'lon', 'Vuosi', 'Syntymäaika', 'Paikka']].copy()
         
-        # Asetetaan 'Animaatiovuosi'-sarake nykyiseksi silmukan vuodeksi.
-        # Näin Plotly luulee, että nämä kaikki tapahtuvat tässä "framessa".
-        step_data['Animaatiovuosi'] = year
-        cumulative_list.append(step_data)
+        if not step_data.empty:
+            step_data['Animaatiovuosi'] = year
+            cumulative_list.append(step_data)
     
-    # Yhdistetään kaikki "framet" yhdeksi isoksi taulukoksi
     if not cumulative_list:
         return df
-    
+        
     return pd.concat(cumulative_list, ignore_index=True)
 
-# --- KÄYTTÖLIITTYMÄ JA LOGIIKKA ---
+# --- KÄYTTÖLIITTYMÄ ---
 
 uploaded_file = st.file_uploader("Lataa GEDCOM-tiedosto (.ged)", type=['ged'])
 
 if uploaded_file is not None:
-    st.info("Tiedosto ladattu. Käsitellään dataa...")
-    
     bytes_data = uploaded_file.getvalue()
     df = parse_gedcom(bytes_data)
     
     if df.empty:
-        st.error("Tiedostosta ei löytynyt sopivia syntymätietoja.")
+        st.error("Tiedostosta ei löytynyt sopivia tietoja.")
     else:
         st.success(f"Löydettiin {len(df)} henkilöä.")
         
-        if st.button("Hae koordinaatit ja piirrä kertyvä kartta"):
+        if st.button("Hae koordinaatit ja piirrä kartta"):
             with st.spinner('Haetaan sijaintitietoja...'):
                 df_geo = geocode_dataframe(df)
             
             if df_geo.empty:
                 st.warning("Koordinaatteja ei löytynyt.")
             else:
-                st.info("Luodaan animaatiokehyksiä (tämä voi kestää hetken)...")
+                st.info("Valmistellaan animaatiota (optimoidaan datamäärää)...")
                 
-                # Järjestetään data ja luodaan kertyvä versio
+                # Järjestys
                 df_geo = df_geo.sort_values("Vuosi")
-                df_cumulative = create_cumulative_data(df_geo)
                 
-                st.success("Valmis! Piirretään karttaa.")
+                # --- OPTIMOINTI ---
+                # Jos dataa on paljon, kasvatetaan aikaväliä
+                aikaväli = 5 
+                if len(df_geo) > 500:
+                    aikaväli = 10
+                    st.warning("Suuri aineisto: Animaatio etenee 10 vuoden hyppäyksin suorituskyvyn takaamiseksi.")
+                
+                df_cumulative = create_cumulative_data(df_geo, step=aikaväli)
+                
+                st.success(f"Valmis! Piirretään {len(df_cumulative)} datapistettä.")
                 
                 # Piirrä kartta
-                fig = px.scatter_mapbox(
-                    df_cumulative,
-                    lat="lat",
-                    lon="lon",
-                    hover_name="Nimi",
-                    hover_data={"Syntymäaika": True, "Paikka": True, "lat": False, "lon": False, "Vuosi": True, "Animaatiovuosi": False},
-                    color_discrete_sequence=['blue'],
-                    zoom=4.5,
-                    center={"lat": 64.5, "lon": 26.0},
-                    animation_frame="Animaatiovuosi", # Käytetään uutta saraketta
-                    title=f"Suvun leviäminen ({df_geo['Vuosi'].min()} - {df_geo['Vuosi'].max()})",
-                    size_max=10
-                )
+                try:
+                    fig = px.scatter_mapbox(
+                        df_cumulative,
+                        lat="lat",
+                        lon="lon",
+                        hover_name="Nimi",
+                        hover_data={"Syntymäaika": True, "Paikka": True, "lat": False, "lon": False, "Vuosi": True, "Animaatiovuosi": False},
+                        color_discrete_sequence=['blue'],
+                        zoom=4.5,
+                        center={"lat": 64.5, "lon": 26.0},
+                        animation_frame="Animaatiovuosi",
+                        title=f"Suvun leviäminen (n. {aikaväli} v välein)",
+                        size_max=10
+                    )
 
-                fig.update_layout(mapbox_style="open-street-map")
-                fig.update_layout(margin={"r":0,"t":40,"l":0,"b":0})
-                
-                st.plotly_chart(fig, use_container_width=True)
-                
-                with st.expander("Katso data"):
-                    st.dataframe(df_geo)
+                    fig.update_layout(mapbox_style="open-street-map")
+                    fig.update_layout(margin={"r":0,"t":40,"l":0,"b":0})
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Karttaa ei voitu piirtää, aineisto on liian raskas selaimelle. ({e})")
